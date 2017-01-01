@@ -69,7 +69,7 @@ namespace Rssdp
 		/// Creates a new UDP socket that is a member of the specified multicast IP address, and binds it to the specified local port.
 		/// </summary>
 		/// <param name="ipAddress">The multicast IP address to make the socket a member of.</param>
-		/// <param name="multicastTimeToLive">The multicase time to live value for the socket.</param>
+		/// <param name="multicastTimeToLive">The multicast time to live value for the socket.</param>
 		/// <param name="localPort">The number of the local port to bind to.</param>
 		/// <returns></returns>
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Naming", "CA1704:IdentifiersShouldBeSpelledCorrectly", MessageId = "ip"), System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Reliability", "CA2000:Dispose objects before losing scope", Justification = "The purpose of this method is to create and returns a disposable result, it is up to the caller to dispose it when they are done with it.")]
@@ -84,7 +84,16 @@ namespace Rssdp
 
 			try
 			{
+#if NETSTANDARD1_3
+				// The ExclusiveAddressUse socket option is a Windows-specific option that, when set to "true," tells Windows not to allow another socket to use the same local address as this socket
+				// See https://github.com/dotnet/corefx/pull/11509 for more details
+				if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+				{
+					retVal.ExclusiveAddressUse = false;
+				}
+#else
 				retVal.ExclusiveAddressUse = false;
+#endif
 				retVal.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
 				retVal.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.MulticastTimeToLive, multicastTimeToLive);
 				retVal.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse(ipAddress), _LocalIP));

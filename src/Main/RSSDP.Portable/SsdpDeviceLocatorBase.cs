@@ -164,22 +164,20 @@ ST: {4}
 			if (searchWaitTime > TimeSpan.Zero)
 				BroadcastDiscoverMessage(searchTarget, SearchTimeToMXValue(searchWaitTime));
 
-			await TaskEx.Run(() =>
+			lock (_SearchResultsSynchroniser)
+			{
+				foreach (var device in GetUnexpiredDevices().Where(NotificationTypeMatchesFilter))
 				{
-					lock (_SearchResultsSynchroniser)
-					{
-						foreach (var device in GetUnexpiredDevices().Where((d) => NotificationTypeMatchesFilter(d)))
-						{
-							if (this.IsDisposed) return;
+					if (this.IsDisposed) break;
 
-							DeviceFound(device, false);
-						}
-					}
-				}).ConfigureAwait(false);
+					DeviceFound(device, false);
+				}
+			}
 
-			if (searchWaitTime != TimeSpan.Zero)
-				await TaskEx.Delay(searchWaitTime);
 
+			if (searchWaitTime != TimeSpan.Zero && !this.IsDisposed)
+				await TaskEx.Delay(searchWaitTime).ConfigureAwait(false);
+			
 			IEnumerable<DiscoveredSsdpDevice> retVal = null;
 
 			try
@@ -479,7 +477,8 @@ ST: {4}
 					Usn = GetFirstHeaderStringValue("USN", message),
 					NotificationType = GetFirstHeaderStringValue("NT", message),
 					CacheLifetime = CacheAgeFromHeader(message.Headers.CacheControl),
-					AsAt = DateTimeOffset.Now
+					AsAt = DateTimeOffset.Now,
+					ResponseHeaders = message.Headers
 				};
 
 				AddOrUpdateDiscoveredDevice(device);
@@ -503,7 +502,8 @@ ST: {4}
 						CacheLifetime = TimeSpan.Zero,
 						DescriptionLocation = null,
 						NotificationType = GetFirstHeaderStringValue("NT", message),
-						Usn = usn
+						Usn = usn,
+						ResponseHeaders = message.Headers
 					};
 
 					if (NotificationTypeMatchesFilter(deadDevice))

@@ -13,7 +13,6 @@ namespace Rssdp
 {
 	// THIS IS A LINKED FILE - SHARED AMONGST MULTIPLE PLATFORMS	
 	// Be careful to check any changes compile and work for all platform projects it is shared in.
-
 	internal sealed class UdpSocket : DisposableManagedObjectBase, IUdpSocket
 	{
 
@@ -29,7 +28,7 @@ namespace Rssdp
 		public UdpSocket(System.Net.Sockets.Socket socket, int localPort, string ipAddress)
 		{
 			if (socket == null) throw new ArgumentNullException("socket");
-
+			
 			_Socket = socket;
 			_LocalPort = localPort;
 
@@ -57,7 +56,21 @@ namespace Rssdp
 			System.Net.EndPoint receivedFromEndPoint = new IPEndPoint(IPAddress.Any, 0);
 			var state = new AsyncReceiveState(_Socket, receivedFromEndPoint);
 			state.TaskCompletionSource = tcs;
-			_Socket.BeginReceiveFrom(state.Buffer, 0, state.Buffer.Length, System.Net.Sockets.SocketFlags.None, ref state.EndPoint, new AsyncCallback(this.ProcessResponse), state);
+#if NETSTANDARD1_3
+			_Socket.ReceiveFromAsync(new System.ArraySegment<Byte>(state.Buffer), System.Net.Sockets.SocketFlags.None, state.EndPoint)
+				.ContinueWith((task, asyncState) =>
+				{
+					if (task.Status != TaskStatus.Faulted)
+					{
+						var receiveState = asyncState as AsyncReceiveState;
+						receiveState.EndPoint = task.Result.RemoteEndPoint;
+						ProcessResponse(receiveState, () => task.Result.ReceivedBytes);
+					}
+				}, state);
+#else
+			_Socket.BeginReceiveFrom(state.Buffer, 0, state.Buffer.Length, System.Net.Sockets.SocketFlags.None, ref state.EndPoint, 
+				new AsyncCallback((result)=> ProcessResponse(state, () => state.Socket.EndReceiveFrom(result, ref state.EndPoint))), state);
+#endif
 
 			return tcs.Task;
 		}
@@ -91,12 +104,11 @@ namespace Rssdp
 		#region Private Methods
 
 		[System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Design", "CA1031:DoNotCatchGeneralExceptionTypes", Justification="Exceptions via task methods should be reported by task completion source, so this should be ok.")]
-		private void ProcessResponse(IAsyncResult asyncResult)
+		private static void ProcessResponse(AsyncReceiveState state, Func<int> receiveData)
 		{
-			var state = asyncResult.AsyncState as AsyncReceiveState;
 			try
 			{
-				var bytesRead = state.Socket.EndReceiveFrom(asyncResult, ref state.EndPoint);
+				var bytesRead = receiveData();
 
 				var ipEndPoint = state.EndPoint as IPEndPoint;
 				state.TaskCompletionSource.SetResult(
@@ -123,10 +135,15 @@ namespace Rssdp
 				else
 					state.TaskCompletionSource.SetCanceled();
 			}
+#if NETSTANDARD
+			// Unrecoverable exceptions should not be getting caught and will be dealt with on a broad level by a high-level catch-all handler
+			// https://github.com/dotnet/corefx/blob/master/Documentation/coding-guidelines/breaking-change-rules.md#exceptions
+#else
 			catch (StackOverflowException) // Handle this manually as we may not be able to call a sub method to check exception type etc.
 			{
 				throw;
 			}
+#endif
 			catch (Exception ex)
 			{
 				if (ex.IsCritical()) //Critical exceptions that indicate memory corruption etc. shouldn't be caught.

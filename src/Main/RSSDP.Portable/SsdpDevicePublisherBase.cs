@@ -18,8 +18,10 @@ namespace Rssdp.Infrastructure
 		private ISsdpCommunicationsServer _CommsServer;
 		private string _OSName;
 		private string _OSVersion;
+		private ISsdpLogger _Log;
 
 		private bool _SupportPnpRootDevice;
+		private SsdpStandardsMode _StandardsMode;
 
 		private IList<SsdpRootDevice> _Devices;
 		private ReadOnlyEnumerable<SsdpRootDevice> _ReadOnlyDevices;
@@ -33,6 +35,7 @@ namespace Rssdp.Infrastructure
 
 		private Random _Random;
 		private TimeSpan _MinCacheTime;
+		private TimeSpan _NotificationBroadcastInterval;
 
 		private const string ServerVersion = "1.0";
 
@@ -54,7 +57,7 @@ LOCATION:{3}{8}
 
 		private const string AliveNotificationMessageFormat = @"NOTIFY * HTTP/1.1
 HOST: 239.255.255.250:1900
-Date: {7}
+DATE: {7}
 NT: {0}
 NTS: ssdp:alive
 SERVER: {4}/{5} UPnP/1.0 RSSDP/{6}
@@ -84,7 +87,18 @@ USN: {1}
 		/// <param name="communicationsServer">The <see cref="ISsdpCommunicationsServer"/> implementation, used to send and receive SSDP network messages.</param>
 		/// <param name="osName">Then name of the operating system running the server.</param>
 		/// <param name="osVersion">The version of the operating system running the server.</param>
-		protected SsdpDevicePublisherBase(ISsdpCommunicationsServer communicationsServer, string osName, string osVersion)
+		protected SsdpDevicePublisherBase(ISsdpCommunicationsServer communicationsServer, string osName, string osVersion) : this(communicationsServer, osName, osVersion, NullLogger.Instance)
+		{
+		}
+
+		/// <summary>
+		/// Full constructor.
+		/// </summary>
+		/// <param name="communicationsServer">The <see cref="ISsdpCommunicationsServer"/> implementation, used to send and receive SSDP network messages.</param>
+		/// <param name="osName">Then name of the operating system running the server.</param>
+		/// <param name="osVersion">The version of the operating system running the server.</param>
+		/// <param name="log">An implementation of <see cref="ISsdpLogger"/> to be used for logging activity. May be null, in which case no logging is performed.</param>
+		protected SsdpDevicePublisherBase(ISsdpCommunicationsServer communicationsServer, string osName, string osVersion, ISsdpLogger log)
 		{
 			if (communicationsServer == null) throw new ArgumentNullException("communicationsServer");
 			if (osName == null) throw new ArgumentNullException("osName");
@@ -92,6 +106,7 @@ USN: {1}
 			if (osVersion == null) throw new ArgumentNullException("osVersion");
 			if (osVersion.Length == 0) throw new ArgumentException("osVersion cannot be an empty string.", "osName");
 
+			_Log = log ?? NullLogger.Instance;
 			_SupportPnpRootDevice = true;
 			_Devices = new List<SsdpRootDevice>();
 			_ReadOnlyDevices = new ReadOnlyEnumerable<SsdpRootDevice>(_Devices);
@@ -103,8 +118,10 @@ USN: {1}
 			_CommsServer.RequestReceived += CommsServer_RequestReceived;
 			_OSName = osName;
 			_OSVersion = osVersion;
-
+			
+			_Log.LogInfo("Publisher started.");
 			_CommsServer.BeginListeningForBroadcasts();
+			_Log.LogInfo("Publisher started listening for broadcasts.");
 		}
 
 		#endregion
@@ -131,7 +148,7 @@ USN: {1}
 
 			_DeviceValidator.ThrowIfDeviceInvalid(device);
 
-			TimeSpan minCacheTime;
+			TimeSpan minCacheTime = TimeSpan.Zero;
 			bool wasAdded = false;
 			lock (_Devices)
 			{
@@ -145,16 +162,18 @@ USN: {1}
 
 			if (wasAdded)
 			{
+				LogDeviceEvent("Device added", device);
+
 				_MinCacheTime = minCacheTime;
 
 				ConnectToDeviceEvents(device);
-
-				WriteTrace("Device Added", device);
 
 				SetRebroadcastAliveNotificationsTimer(minCacheTime);
 
 				SendAliveNotifications(device, true);
 			}
+			else
+				LogDeviceEventWarning("AddDevice ignored (duplicate add)", device);
 		}
 
 		/// <summary>
@@ -173,7 +192,7 @@ USN: {1}
 			ThrowIfDisposed();
 
 			bool wasRemoved = false;
-			TimeSpan minCacheTime;
+			TimeSpan minCacheTime = TimeSpan.Zero;
 			lock (_Devices)
 			{
 				if (_Devices.Contains(device))
@@ -190,17 +209,30 @@ USN: {1}
 
 				DisconnectFromDeviceEvents(device);
 
-				WriteTrace("Device Removed", device);
+				LogDeviceEvent("Device Removed", device);
 
 				SendByeByeNotifications(device, true);
 
 				SetRebroadcastAliveNotificationsTimer(minCacheTime);
 			}
+			else
+				LogDeviceEventWarning("RemoveDevice ignored (device not in publisher)", device);
 		}
 
 		#endregion
 
 		#region Public Properties
+
+		/// <summary>
+		/// Returns a reference to the injected <see cref="ISsdpLogger"/> instance.
+		/// </summary>
+		/// <remarks>
+		/// <para>Should never return null. If null was injected a reference to an internal null logger should be returned.</para>
+		/// </remarks>
+		protected ISsdpLogger Log
+		{
+			get { return _Log; }
+		}
 
 		/// <summary>
 		/// Returns a read only list of devices being published by this instance.
@@ -220,12 +252,65 @@ USN: {1}
 		/// <para>Enabling this option will cause devices to show up in Microsoft Windows Explorer's network screens (if discovery is enabled etc.). Windows Explorer appears to search only for pnp:rootdeivce and not upnp:rootdevice.</para>
 		/// <para>If false, the system will only use upnp:rootdevice for notifiation broadcasts and and search responses, which is correct according to the UPnP/SSDP spec.</para>
 		/// </remarks>
+		[Obsolete("Set StandardsMode to SsdpStandardsMode.Relaxed instead.")]
 		public bool SupportPnpRootDevice
 		{
 			get { return _SupportPnpRootDevice; }
 			set
 			{
-				_SupportPnpRootDevice = value;
+				if (_SupportPnpRootDevice != value)
+				{
+					_SupportPnpRootDevice = value;
+					_Log.LogInfo("SupportPnpRootDevice set to " + value.ToString());
+				}
+			}
+		}
+
+		/// <summary>
+		/// Sets or returns a value from the <see cref="SsdpStandardsMode"/> controlling how strictly the publisher obeys the SSDP standard.
+		/// </summary>
+		/// <remarks>
+		/// <para>Using relaxed mode will process search requests even if the MX header is missing.</para>
+		/// </remarks>
+		public SsdpStandardsMode StandardsMode
+		{
+			get { return _StandardsMode; }
+			set
+			{
+				if (_StandardsMode != value)
+				{
+					_StandardsMode = value;
+					_Log.LogInfo("StandardsMode set to " + value.ToString());
+				}
+			}
+		}
+
+		/// <summary>
+		/// Sets or returns a fixed interval at which alive notifications for services exposed by this publisher instance are broadcast.
+		/// </summary>
+		/// <remarks>
+		/// <para>If this is set to <see cref="TimeSpan.Zero"/> then the system will follow the process recommended 
+		/// by the SSDP spec and calculate a randomised interval based on the cache life times of the published services.
+		/// The default and recommended value is TimeSpan.Zero.
+		/// </para>
+		/// <para>While (zero and) any positive <see cref="TimeSpan"/> value are allowed, the SSDP specification says 
+		/// notifications should not be broadcast more often than 15 minutes. If you wish to remain compatible with the SSDP
+		/// specification, do not set this property to a value greater than zero but less than 15 minutes.
+		/// </para>
+		/// </remarks>
+		public TimeSpan NotificationBroadcastInterval
+		{
+			get { return _NotificationBroadcastInterval; }
+			set
+			{
+				if (value.TotalSeconds < 0) throw new ArgumentException("Cannot be less than zero.", nameof(value));
+
+				if (_NotificationBroadcastInterval != value)
+				{
+					_NotificationBroadcastInterval = value;
+					_Log.LogInfo("NotificationBroadcastInterval set to " + value.ToString());
+					SetRebroadcastAliveNotificationsTimer(_MinCacheTime);
+				}
 			}
 		}
 
@@ -241,6 +326,10 @@ USN: {1}
 		{
 			if (disposing)
 			{
+				_Log.LogInfo("Publisher disposed.");
+
+				DisposeRebroadcastTimer();
+
 				var commsServer = _CommsServer;
 				_CommsServer = null;
 
@@ -250,8 +339,6 @@ USN: {1}
 					if (!commsServer.IsShared)
 						commsServer.Dispose();
 				}
-
-				DisposeRebroadcastTimer();
 
 				foreach (var device in this.Devices)
 				{
@@ -272,29 +359,32 @@ USN: {1}
 		{
 			if (String.IsNullOrEmpty(searchTarget))
 			{
-				WriteTrace(String.Format("Invalid search request received From {0}, Target is null/empty.", endPoint.ToString()));
+				_Log.LogWarning(String.Format("Invalid search request received From {0}, Target is null/empty.", endPoint.ToString()));
 				return;
 			}
 
-			WriteTrace(String.Format("Search Request Received From {0}, Target = {1}", endPoint.ToString(), searchTarget));
+			_Log.LogInfo(String.Format("Search Request Received From {0}, Target = {1}", endPoint.ToString(), searchTarget));
 
 			if (IsDuplicateSearchRequest(searchTarget, endPoint))
 			{
-				WriteTrace("Search Request is Duplicate, ignoring.");
+				Log.LogWarning("Search Request is Duplicate, ignoring.");
 				return;
 			}
 
 			//Wait on random interval up to MX, as per SSDP spec.
-			//Also, as per UPnP 1.1/SSDP spec ignore missing/bank MX header. If over 120, assume random value between 0 and 120.
+			//Also, as per UPnP 1.1/SSDP spec ignore missing/bank MX header (strict mode only). If over 120, assume random value between 0 and 120.
 			//Using 16 as minimum as that's often the minimum system clock frequency anyway.
 			int maxWaitInterval = 0;
 			if (String.IsNullOrEmpty(mx))
 			{
 				//Windows Explorer is poorly behaved and doesn't supply an MX header value.
-				if (this.SupportPnpRootDevice)
+				if (IsWindowsExplorerSupportEnabled)
 					mx = "1";
 				else
+				{
+					_Log.LogWarning("Search Request ignored due to missing MX header. Set StandardsMode to relaxed to respond to these requests.");
 					return;
+				}
 			}
 
 			if (!Int32.TryParse(mx, out maxWaitInterval) || maxWaitInterval <= 0) return;
@@ -304,33 +394,100 @@ USN: {1}
 
 			//Do not block synchronously as that may tie up a threadpool thread for several seconds.
 			TaskEx.Delay(_Random.Next(16, (maxWaitInterval * 1000))).ContinueWith((parentTask) =>
+			{
+				//Copying devices to local array here to avoid threading issues/enumerator exceptions.
+				IEnumerable<SsdpDevice> devices = null;
+				devices = GetDevicesMatchingSearchTarget(searchTarget, devices);
+
+				if (devices != null)
 				{
-					//Copying devices to local array here to avoid threading issues/enumerator exceptions.
-					IEnumerable<SsdpDevice> devices = null;
-					lock (_Devices)
+					_Log.LogInfo(String.Format("Sending search responses for {0} devices", devices.Count()));
+
+					if (searchTarget.Contains(":service:"))
 					{
-						if (String.Compare(SsdpConstants.SsdpDiscoverAllSTHeader, searchTarget, StringComparison.OrdinalIgnoreCase) == 0)
-							devices = GetAllDevicesAsFlatEnumerable().ToArray();
-						else if (String.Compare(SsdpConstants.UpnpDeviceTypeRootDevice, searchTarget, StringComparison.OrdinalIgnoreCase) == 0 || (this.SupportPnpRootDevice && String.Compare(SsdpConstants.PnpDeviceTypeRootDevice, searchTarget, StringComparison.OrdinalIgnoreCase) == 0))
-							devices = _Devices.ToArray();
-						else if (searchTarget.Trim().StartsWith("uuid:", StringComparison.OrdinalIgnoreCase))
-							devices = (from device in GetAllDevicesAsFlatEnumerable() where String.Compare(device.Uuid, searchTarget.Substring(5), StringComparison.OrdinalIgnoreCase) == 0 select device).ToArray();
-						else if (searchTarget.StartsWith("urn:", StringComparison.OrdinalIgnoreCase))
-							devices = (from device in GetAllDevicesAsFlatEnumerable() where String.Compare(device.FullDeviceType, searchTarget, StringComparison.OrdinalIgnoreCase) == 0 select device).ToArray();
+						foreach (var device in devices)
+						{
+							SendServiceSearchResponses(device, searchTarget, endPoint);
+						}
 					}
-
-					if (devices != null)
+					else
 					{
-						WriteTrace(String.Format("Sending {0} search responses", devices.Count()));
-
 						foreach (var device in devices)
 						{
 							SendDeviceSearchResponses(device, endPoint);
 						}
 					}
+				}
+				else
+					_Log.LogWarning("Sending search responses for 0 devices (no matching targets).");
+			});
+		}
+
+		private IEnumerable<SsdpDevice> GetDevicesMatchingSearchTarget(string searchTarget, IEnumerable<SsdpDevice> devices)
+		{
+			lock (_Devices)
+			{
+				if (String.Compare(SsdpConstants.SsdpDiscoverAllSTHeader, searchTarget, StringComparison.OrdinalIgnoreCase) == 0)
+					devices = GetAllDevicesAsFlatEnumerable().ToArray();
+				else if (String.Compare(SsdpConstants.UpnpDeviceTypeRootDevice, searchTarget, StringComparison.OrdinalIgnoreCase) == 0 || (IsWindowsExplorerSupportEnabled && String.Compare(SsdpConstants.PnpDeviceTypeRootDevice, searchTarget, StringComparison.OrdinalIgnoreCase) == 0))
+					devices = _Devices.ToArray();
+				else if (searchTarget.Trim().StartsWith("uuid:", StringComparison.OrdinalIgnoreCase))
+				{
+					devices = (
+											from device
+											in GetAllDevicesAsFlatEnumerable()
+											where String.Compare(device.Uuid, searchTarget.Substring(5), StringComparison.OrdinalIgnoreCase) == 0
+											select device
+										).ToArray();
+				}
+				else if (searchTarget.StartsWith("urn:", StringComparison.OrdinalIgnoreCase))
+				{
+					if (searchTarget.Contains(":service:"))
+					{
+						devices = (from
+											 device in GetAllDevicesAsFlatEnumerable()
+											 where
+													(
+														from s in
+														device.Services
+														where String.Compare(s.FullServiceType, searchTarget, StringComparison.OrdinalIgnoreCase) == 0
+														select s
+													).Any()
+											 select device
+											).ToArray();
+					}
 					else
-						WriteTrace(String.Format("Sending 0 search responses."));
-				});
+					{
+						devices =
+						(
+							from device
+							in GetAllDevicesAsFlatEnumerable()
+							where String.Compare(device.FullDeviceType, searchTarget, StringComparison.OrdinalIgnoreCase) == 0
+							select device
+						).ToArray();
+					}
+				}
+			}
+
+			return devices;
+		}
+
+		private bool IsWindowsExplorerSupportEnabled
+		{
+			get
+			{
+#pragma warning disable CS0618 // Type or member is obsolete
+				return SupportPnpRootDevice || IsRelaxedStandardsMode;
+#pragma warning restore CS0618 // Type or member is obsolete
+			}
+		}
+
+		private bool IsRelaxedStandardsMode
+		{
+			get
+			{
+				return this.StandardsMode != SsdpStandardsMode.Strict;
+			}
 		}
 
 		private IEnumerable<SsdpDevice> GetAllDevicesAsFlatEnumerable()
@@ -344,13 +501,19 @@ USN: {1}
 			if (isRootDevice)
 			{
 				SendSearchResponse(SsdpConstants.UpnpDeviceTypeRootDevice, device, GetUsn(device.Udn, SsdpConstants.UpnpDeviceTypeRootDevice), endPoint);
-				if (this.SupportPnpRootDevice)
+				if (IsWindowsExplorerSupportEnabled)
 					SendSearchResponse(SsdpConstants.PnpDeviceTypeRootDevice, device, GetUsn(device.Udn, SsdpConstants.PnpDeviceTypeRootDevice), endPoint);
 			}
 
 			SendSearchResponse(device.Udn, device, device.Udn, endPoint);
 
 			SendSearchResponse(device.FullDeviceType, device, GetUsn(device.Udn, device.FullDeviceType), endPoint);
+		}
+
+		private void SendServiceSearchResponses(SsdpDevice device, string searchTarget, UdpEndPoint endPoint)
+		{
+			//uuid:device-UUID::urn:domain-name:service:serviceType:ver 
+			SendSearchResponse(searchTarget, device, device.Udn + "::" + searchTarget, endPoint);
 		}
 
 		private static string GetUsn(string udn, string fullDeviceType)
@@ -373,12 +536,12 @@ USN: {1}
 					_OSVersion,
 					ServerVersion,
 					DateTime.UtcNow.ToString("r"),
-										additionalheaders
+					additionalheaders
 				);
 
 			_CommsServer.SendMessage(System.Text.UTF8Encoding.UTF8.GetBytes(message), endPoint);
 
-			WriteTrace(String.Format("Sent search response to " + endPoint.ToString()), device);
+			LogDeviceEventVerbose(String.Format("Sent search response ({0}) to {1}", uniqueServiceName, endPoint.ToString()), device);
 		}
 
 		private bool IsDuplicateSearchRequest(string searchTarget, UdpEndPoint endPoint)
@@ -434,9 +597,27 @@ USN: {1}
 			{
 				if (IsDisposed) return;
 
-				DisposeRebroadcastTimer();
+				try
+				{
+					//Only dispose the timer so it gets re-created if we're following
+					//the SSDP Spec and randomising the broadcast interval.
+					//If we're using a fixed interval, no need to kill the timer as it's 
+					//already set to go off on the correct interval.
+					if (_NotificationBroadcastInterval == TimeSpan.Zero)
+						DisposeRebroadcastTimer();
+				}
+				finally
+				{
+					// Must reset this here, otherwise if the next reset interval
+					// is calculated to be the same as the previous one we won't
+					// reset the timer.
+					// Reset it to _NotificationBroadcastInterval which is either TimeSpan.Zero 
+					// which will cause the system to calculate a new random interval, or it's the 
+					// current fixed interval which is fine.
+					_RebroadcastAliveNotificationsTimeSpan = _NotificationBroadcastInterval;
+				}
 
-				WriteTrace("Sending Alive Notifications For All Devices");
+				_Log.LogInfo("Sending Alive Notifications For All Devices");
 
 				_LastNotificationTime = DateTime.Now;
 
@@ -455,7 +636,7 @@ USN: {1}
 			}
 			catch (ObjectDisposedException ex)
 			{
-				WriteTrace("Publisher stopped, exception " + ex.Message);
+				_Log.LogWarning("Publisher stopped, exception " + ex.Message);
 				Dispose();
 			}
 			finally
@@ -470,12 +651,19 @@ USN: {1}
 			if (isRoot)
 			{
 				SendAliveNotification(device, SsdpConstants.UpnpDeviceTypeRootDevice, GetUsn(device.Udn, SsdpConstants.UpnpDeviceTypeRootDevice));
+#pragma warning disable CS0618 // Type or member is obsolete
 				if (this.SupportPnpRootDevice)
+#pragma warning restore CS0618 // Type or member is obsolete
 					SendAliveNotification(device, SsdpConstants.PnpDeviceTypeRootDevice, GetUsn(device.Udn, SsdpConstants.PnpDeviceTypeRootDevice));
 			}
 
 			SendAliveNotification(device, device.Udn, device.Udn);
 			SendAliveNotification(device, device.FullDeviceType, GetUsn(device.Udn, device.FullDeviceType));
+
+			foreach (var service in device.Services)
+			{
+				SendAliveNotification(device, service);
+			}
 
 			foreach (var childDevice in device.Devices)
 			{
@@ -500,7 +688,12 @@ USN: {1}
 
 			_CommsServer.SendMulticastMessage(System.Text.UTF8Encoding.UTF8.GetBytes(message));
 
-			WriteTrace(String.Format("Sent alive notification"), device);
+			LogDeviceEvent(String.Format("Sent alive notification NT={0}, USN={1}", notificationType, uniqueServiceName), device);
+		}
+
+		private void SendAliveNotification(SsdpDevice device, SsdpService service)
+		{
+			SendAliveNotification(device, service.FullServiceType, device.Udn + "::" + service.FullServiceType);
 		}
 
 		#endregion
@@ -512,12 +705,19 @@ USN: {1}
 			if (isRoot)
 			{
 				SendByeByeNotification(device, SsdpConstants.UpnpDeviceTypeRootDevice, GetUsn(device.Udn, SsdpConstants.UpnpDeviceTypeRootDevice));
+#pragma warning disable CS0618 // Type or member is obsolete
 				if (this.SupportPnpRootDevice)
+#pragma warning restore CS0618 // Type or member is obsolete
 					SendByeByeNotification(device, "pnp:rootdevice", GetUsn(device.Udn, "pnp:rootdevice"));
 			}
 
 			SendByeByeNotification(device, device.Udn, device.Udn);
 			SendByeByeNotification(device, String.Format("urn:{0}", device.FullDeviceType), GetUsn(device.Udn, device.FullDeviceType));
+
+			foreach (var service in device.Services)
+			{
+				SendByeByeNotification(device, service);
+			}
 
 			foreach (var childDevice in device.Devices)
 			{
@@ -539,7 +739,12 @@ USN: {1}
 
 			_CommsServer.SendMulticastMessage(System.Text.UTF8Encoding.UTF8.GetBytes(message));
 
-			WriteTrace(String.Format("Sent byebye notification"), device);
+			LogDeviceEvent(String.Format("Sent byebye notification, NT={0}, USN={1}", notificationType, uniqueServiceName), device);
+		}
+
+		private void SendByeByeNotification(SsdpDevice device, SsdpService service)
+		{
+			SendByeByeNotification(device, service.FullServiceType, device.Udn + "::" + service.FullServiceType);
 		}
 
 		#endregion
@@ -556,19 +761,28 @@ USN: {1}
 
 		private void SetRebroadcastAliveNotificationsTimer(TimeSpan minCacheTime)
 		{
-			if (minCacheTime == _RebroadcastAliveNotificationsTimeSpan) return;
+			TimeSpan rebroadCastInterval = TimeSpan.Zero;
+			if (this.NotificationBroadcastInterval != TimeSpan.Zero)
+			{
+				if (_RebroadcastAliveNotificationsTimeSpan == this.NotificationBroadcastInterval) return;
+
+				rebroadCastInterval = this.NotificationBroadcastInterval;
+			}
+			else
+			{
+				if (minCacheTime == _RebroadcastAliveNotificationsTimeSpan) return;
+				if (minCacheTime == TimeSpan.Zero) return;
+
+				// According to UPnP/SSDP spec, we should randomise the interval at 
+				// which we broadcast notifications, to help with network congestion.
+				// Specs also advise to choose a random interval up to *half* the cache time.
+				// Here we do that, but using the minimum non-zero cache time of any device we are publishing.
+				rebroadCastInterval = new TimeSpan(Convert.ToInt64((_Random.Next(1, 50) / 100D) * (minCacheTime.Ticks / 2)));
+			}
 
 			DisposeRebroadcastTimer();
 
-			if (minCacheTime == TimeSpan.Zero) return;
-
-			// According to UPnP/SSDP spec, we should randomise the interval at 
-			// which we broadcast notifications, to help with network congestion.
-			// Specs also advise to choose a random interval up to *half* the cache time.
-			// Here we do that, but using the minimum non-zero cache time of any device we are publishing.
-			var rebroadCastInterval = new TimeSpan(Convert.ToInt64((_Random.Next(1, 50) / 100D) * (minCacheTime.Ticks / 2)));
-
-			// If we were already setup to rebroadcast someime in the future,
+			// If we were already setup to rebroadcast sometime in the future,
 			// don't just blindly reset the next broadcast time to the new interval
 			// as repeatedly changing the interval might end up causing us to over
 			// delay in sending the next one.
@@ -585,7 +799,7 @@ USN: {1}
 			_RebroadcastAliveNotificationsTimeSpan = rebroadCastInterval;
 			_RebroadcastAliveNotificationsTimer = new System.Threading.Timer(SendAllAliveNotifications, null, nextBroadcastInterval, rebroadCastInterval);
 
-			WriteTrace(String.Format("Rebroadcast Interval = {0}, Next Broadcast At = {1}", rebroadCastInterval.ToString(), nextBroadcastInterval.ToString()));
+			_Log.LogInfo(String.Format("Rebroadcast Interval = {0}, Next Broadcast At = {1}", rebroadCastInterval.ToString(), nextBroadcastInterval.ToString()));
 		}
 
 		private TimeSpan GetMinimumNonZeroCacheLifetime()
@@ -623,24 +837,36 @@ USN: {1}
 				return String.Format("CACHE-CONTROL: public, max-age={0}", device.CacheLifetime.TotalSeconds);
 		}
 
-		private static void WriteTrace(string text)
+		private void LogDeviceEvent(string text, SsdpDevice device)
 		{
-			System.Diagnostics.Debug.WriteLine(text, "SSDP Publisher");
+			_Log.LogInfo(GetDeviceEventLogMessage(text, device));
 		}
 
-		private static void WriteTrace(string text, SsdpDevice device)
+		private void LogDeviceEventWarning(string text, SsdpDevice device)
+		{
+			_Log.LogWarning(GetDeviceEventLogMessage(text, device));
+		}
+
+		private void LogDeviceEventVerbose(string text, SsdpDevice device)
+		{
+			_Log.LogVerbose(GetDeviceEventLogMessage(text, device));
+		}
+
+		private static string GetDeviceEventLogMessage(string text, SsdpDevice device)
 		{
 			var rootDevice = device as SsdpRootDevice;
 			if (rootDevice != null)
-				WriteTrace(text + " " + device.DeviceType + " - " + device.Uuid + " - " + rootDevice.Location);
+				return text + " " + device.DeviceType + " - " + device.Uuid + " - " + rootDevice.Location;
 			else
-				WriteTrace(text + " " + device.DeviceType + " - " + device.Uuid);
+				return text + " " + device.DeviceType + " - " + device.Uuid;
 		}
 
 		private void ConnectToDeviceEvents(SsdpDevice device)
 		{
 			device.DeviceAdded += device_DeviceAdded;
 			device.DeviceRemoved += device_DeviceRemoved;
+			device.ServiceAdded += device_ServiceAdded;
+			device.ServiceRemoved += device_ServiceRemoved;
 
 			foreach (var childDevice in device.Devices)
 			{
@@ -652,6 +878,8 @@ USN: {1}
 		{
 			device.DeviceAdded -= device_DeviceAdded;
 			device.DeviceRemoved -= device_DeviceRemoved;
+			device.ServiceAdded -= device_ServiceAdded;
+			device.ServiceRemoved -= device_ServiceRemoved;
 
 			foreach (var childDevice in device.Devices)
 			{
@@ -673,6 +901,24 @@ USN: {1}
 			return returnValue.ToString();
 		}
 
+		private static bool DeviceHasServiceOfType(SsdpDevice device, string fullServiceType)
+		{
+			int retries = 0;
+			while (retries < 5)
+			{
+				try
+				{
+					return (from s in device.Services where s.FullServiceType == fullServiceType select s).Any();
+				}
+				catch (InvalidOperationException) // Collection modified during enumeration
+				{
+					retries++;
+				}
+			}
+
+			return true;
+		}
+
 		#endregion
 
 		#region Event Handlers
@@ -689,6 +935,27 @@ USN: {1}
 			DisconnectFromDeviceEvents(e.Device);
 		}
 
+		private void device_ServiceAdded(object sender, ServiceEventArgs e)
+		{
+			//Technically we should only do this once per service type,
+			//but if we add services during runtime there is no way to
+			//notify anyone except by resending this notification.
+			_Log.LogInfo(String.Format("Service added: {0} ({1})", e.Service.ServiceId, e.Service.FullServiceType));
+
+			SendAliveNotification((SsdpDevice)sender, e.Service);
+		}
+
+		private void device_ServiceRemoved(object sender, ServiceEventArgs e)
+		{
+			_Log.LogInfo(String.Format("Service removed: {0} ({1})", e.Service.ServiceId, e.Service.FullServiceType));
+
+			var device = (SsdpDevice)sender;
+			//Only say this service type has disappeared if there are no 
+			//services of this type left.
+			if (!DeviceHasServiceOfType(device, e.Service.FullServiceType))
+				SendByeByeNotification(device, e.Service);
+		}
+
 		private void CommsServer_RequestReceived(object sender, RequestReceivedEventArgs e)
 		{
 			if (this.IsDisposed) return;
@@ -696,13 +963,15 @@ USN: {1}
 			if (e.Message.Method.Method == SsdpConstants.MSearchMethod)
 			{
 				//According to SSDP/UPnP spec, ignore message if missing these headers.
-				if (!e.Message.Headers.Contains("MX"))
-					WriteTrace("Ignoring search request - missing MX header.");
-				else if (!e.Message.Headers.Contains("MAN"))
-					WriteTrace("Ignoring search request - missing MAN header.");
+				if (!e.Message.Headers.Contains("MX") && !IsRelaxedStandardsMode)
+					_Log.LogWarning("Ignoring search request - missing MX header. Set StandardsMode to relaxed to process these search requests.");
+				else if (!e.Message.Headers.Contains("MAN") && !IsRelaxedStandardsMode)
+					_Log.LogWarning("Ignoring search request - missing MAN header. Set StandardsMode to relaxed to process these search requests.");
 				else
 					ProcessSearchRequest(GetFirstHeaderValue(e.Message.Headers, "MX"), GetFirstHeaderValue(e.Message.Headers, "ST"), e.ReceivedFrom);
 			}
+			else if (String.Compare(e.Message.Method.Method, "NOTIFY", StringComparison.OrdinalIgnoreCase) != 0)
+				_Log.LogWarning(String.Format("Unknown request \"{0}\"received, ignoring.", e.Message.Method.Method));
 		}
 
 		#endregion
